@@ -1,0 +1,481 @@
+"""
+Single-file Flask application implementing an admin-only CRUD
+interface for employee records with authentication and validation.
+
+How to use:
+1. Create a virtualenv and install dependencies:
+   python -m venv venv
+   source venv/bin/activate   # macOS / Linux
+   venv\Scripts\activate    # Windows
+   pip install Flask Flask-Login Flask-WTF Flask-SQLAlchemy email-validator
+
+2. Run the app:
+   python flask_employee_crud.py
+
+3. Open http://127.0.0.1:5000 in your browser.
+
+Default behavior:
+- On first run the database will be created automatically.
+- Use the built-in CLI command to create an admin user:
+    from flask_employee_crud import create_admin
+    create_admin('admin@example.com', 'yourpassword')
+  (Or use the interactive prompt shown when you visit /register if allowed.)
+
+Note: This is a demo app. For production, use environment
+configuration, HTTPS, stronger session protections and deployment
+recommendations.
+"""
+
+from flask import Flask, render_template_string, redirect, url_for, request, flash, abort
+from flask_sqlalchemy import SQLAlchemy
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField, DecimalField, DateField, TextAreaField
+from wtforms.validators import DataRequired, Email, Length, EqualTo, ValidationError, NumberRange, Optional
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
+from datetime import datetime
+import os
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'employees.db')
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + DB_PATH
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+
+# -----------------
+# Models
+# -----------------
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class Employee(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    first_name = db.Column(db.String(80), nullable=False)
+    last_name = db.Column(db.String(80), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    position = db.Column(db.String(120), nullable=False)
+    salary = db.Column(db.Numeric(12, 2), nullable=True)
+    date_hired = db.Column(db.Date, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
+
+    def __repr__(self):
+        return f"<Employee {self.id} {self.first_name} {self.last_name}>"
+
+
+# -----------------
+# Forms
+# -----------------
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email(), Length(max=120)])
+    password = PasswordField('Password', validators=[DataRequired()])
+    submit = SubmitField('Log in')
+
+
+class RegisterForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email(), Length(max=120)])
+    password = PasswordField('Password', validators=[DataRequired(), Length(min=6)])
+    confirm = PasswordField('Confirm Password', validators=[DataRequired(), EqualTo('password')])
+    submit = SubmitField('Register')
+
+    def validate_email(self, email):
+        if User.query.filter_by(email=email.data.lower()).first():
+            raise ValidationError('Email already registered.')
+
+
+class EmployeeForm(FlaskForm):
+    first_name = StringField('First name', validators=[DataRequired(), Length(max=80)])
+    last_name = StringField('Last name', validators=[DataRequired(), Length(max=80)])
+    email = StringField('Email', validators=[DataRequired(), Email(), Length(max=120)])
+    position = StringField('Position', validators=[DataRequired(), Length(max=120)])
+    salary = DecimalField('Salary', validators=[Optional(), NumberRange(min=0)], places=2)
+    date_hired = DateField('Date hired (YYYY-MM-DD)', validators=[Optional()], format='%Y-%m-%d')
+    notes = TextAreaField('Notes', validators=[Optional(), Length(max=2000)])
+    submit = SubmitField('Save')
+
+    def validate_email(self, field):
+        # Ensure unique employee email
+        employee_id = request.view_args.get('employee_id') if request.view_args else None
+        ex = Employee.query.filter_by(email=field.data.lower()).first()
+        if ex and (employee_id is None or ex.id != int(employee_id)):
+            raise ValidationError('Another employee with this email already exists.')
+
+
+# -----------------
+# Helpers
+# -----------------
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+def admin_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return login_manager.unauthorized()
+        if not getattr(current_user, 'is_admin', False):
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+
+
+# -----------------
+# Routes
+# -----------------
+@app.route('/')
+@login_required
+def index():
+    # Only admins can access employee listing
+    if not current_user.is_admin:
+        return render_template_string(BASE_TEMPLATE, content='<h3>Access denied</h3><p>You are not an administrator.</p>')
+    employees = Employee.query.order_by(Employee.last_name, Employee.first_name).all()
+    return render_template_string(LIST_TEMPLATE, employees=employees)
+
+
+@app.route('/employee/<int:employee_id>')
+@login_required
+@admin_required
+def employee_detail(employee_id):
+    e = Employee.query.get_or_404(employee_id)
+    return render_template_string(DETAIL_TEMPLATE, employee=e)
+
+
+@app.route('/employee/create', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def employee_create():
+    form = EmployeeForm()
+    if form.validate_on_submit():
+        emp = Employee(
+            first_name=form.first_name.data.strip(),
+            last_name=form.last_name.data.strip(),
+            email=form.email.data.lower().strip(),
+            position=form.position.data.strip(),
+            salary=form.salary.data,
+            date_hired=form.date_hired.data,
+            notes=form.notes.data.strip() if form.notes.data else None,
+        )
+        db.session.add(emp)
+        db.session.commit()
+        flash('Employee created.', 'success')
+        return redirect(url_for('index'))
+    return render_template_string(EMPLOYEE_FORM_TEMPLATE, form=form, action='Create')
+
+
+@app.route('/employee/<int:employee_id>/edit', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def employee_edit(employee_id):
+    emp = Employee.query.get_or_404(employee_id)
+    form = EmployeeForm(obj=emp)
+    # Attach employee_id to view_args so validation can check uniqueness properly
+    request.view_args['employee_id'] = employee_id
+    if form.validate_on_submit():
+        emp.first_name = form.first_name.data.strip()
+        emp.last_name = form.last_name.data.strip()
+        emp.email = form.email.data.lower().strip()
+        emp.position = form.position.data.strip()
+        emp.salary = form.salary.data
+        emp.date_hired = form.date_hired.data
+        emp.notes = form.notes.data.strip() if form.notes.data else None
+        db.session.commit()
+        flash('Employee updated.', 'success')
+        return redirect(url_for('employee_detail', employee_id=emp.id))
+    return render_template_string(EMPLOYEE_FORM_TEMPLATE, form=form, action='Edit')
+
+
+@app.route('/employee/<int:employee_id>/delete', methods=['POST'])
+@login_required
+@admin_required
+def employee_delete(employee_id):
+    emp = Employee.query.get_or_404(employee_id)
+    db.session.delete(emp)
+    db.session.commit()
+    flash('Employee deleted.', 'success')
+    return redirect(url_for('index'))
+
+
+# Auth routes
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data.lower().strip()).first()
+        if user and user.check_password(form.password.data):
+            login_user(user)
+            flash('Logged in successfully.', 'success')
+            return redirect(url_for('index'))
+        flash('Invalid email or password.', 'danger')
+    return render_template_string(LOGIN_TEMPLATE, form=form)
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Logged out.', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    # Registration route is provided for convenience but in many systems
+    # you may want to restrict admin creation to CLI or other secure flows.
+    if current_user.is_authenticated and not current_user.is_admin:
+        abort(403)
+    form = RegisterForm()
+    if form.validate_on_submit():
+        user = User(email=form.email.data.lower().strip())
+        user.set_password(form.password.data)
+        # By default, first registered user becomes admin for convenience
+        existing = User.query.count()
+        user.is_admin = (existing == 0)
+        db.session.add(user)
+        db.session.commit()
+        flash('Registration successful. You can now log in.', 'success')
+        return redirect(url_for('login'))
+    return render_template_string(REGISTER_TEMPLATE, form=form)
+
+
+# -----------------
+# Database initialization helpers
+# -----------------
+@app.before_first_request
+def create_tables():
+    db.create_all()
+
+
+def create_admin(email, password):
+    """Utility to create admin user. Call from Python shell if needed."""
+    with app.app_context():
+        if User.query.filter_by(email=email.lower()).first():
+            print('User already exists')
+            return
+        u = User(email=email.lower(), is_admin=True)
+        u.set_password(password)
+        db.session.add(u)
+        db.session.commit()
+        print('Admin created.')
+
+
+# -----------------
+# Minimal templates (render_template_string for single-file simplicity)
+# -----------------
+BASE_TEMPLATE = """
+<!doctype html>
+<title>Employee Admin</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+<div class="container py-4">
+  <nav class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+      <a class="navbar-brand" href="{{ url_for('index') }}">Employee Admin</a>
+    </div>
+    <div>
+      {% if current_user.is_authenticated %}
+        <span class="me-2">{{ current_user.email }}</span>
+        <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('logout') }}">Logout</a>
+      {% else %}
+        <a class="btn btn-primary btn-sm" href="{{ url_for('login') }}">Login</a>
+      {% endif %}
+    </div>
+  </nav>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for cat, msg in messages %}
+        <div class="alert alert-{{ cat }}">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  {{ content|safe }}
+</div>
+"""
+
+LIST_TEMPLATE = """
+{% extends base %}
+{% block body %}
+{% set base = BASE_TEMPLATE %}
+{% endset %}
+"""  # We'll substitute base at render time
+
+# Because render_template_string needs the base in context, we'll combine manually below.
+LIST_TEMPLATE = BASE_TEMPLATE.replace('{{ content|safe }}',
+    """
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h3>Employees</h3>
+      <div>
+        <a class="btn btn-success" href="{{ url_for('employee_create') }}">+ Create Employee</a>
+      </div>
+    </div>
+    {% if employees %}
+    <table class="table table-striped">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Name</th>
+          <th>Email</th>
+          <th>Position</th>
+          <th>Date hired</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in employees %}
+        <tr>
+          <td>{{ e.id }}</td>
+          <td>{{ e.last_name }}, {{ e.first_name }}</td>
+          <td>{{ e.email }}</td>
+          <td>{{ e.position }}</td>
+          <td>{{ e.date_hired or '' }}</td>
+          <td>
+            <a class="btn btn-sm btn-primary" href="{{ url_for('employee_detail', employee_id=e.id) }}">View</a>
+            <a class="btn btn-sm btn-secondary" href="{{ url_for('employee_edit', employee_id=e.id) }}">Edit</a>
+            <form style="display:inline" method="post" action="{{ url_for('employee_delete', employee_id=e.id) }}" onsubmit="return confirm('Delete this employee?');">
+              <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p>No employees yet.</p>
+    {% endif %}
+    """
+)
+
+DETAIL_TEMPLATE = BASE_TEMPLATE.replace('{{ content|safe }}',
+    """
+    <h3>Employee detail</h3>
+    <dl class="row">
+      <dt class="col-sm-3">Name</dt><dd class="col-sm-9">{{ employee.first_name }} {{ employee.last_name }}</dd>
+      <dt class="col-sm-3">Email</dt><dd class="col-sm-9">{{ employee.email }}</dd>
+      <dt class="col-sm-3">Position</dt><dd class="col-sm-9">{{ employee.position }}</dd>
+      <dt class="col-sm-3">Salary</dt><dd class="col-sm-9">{{ employee.salary or '' }}</dd>
+      <dt class="col-sm-3">Date hired</dt><dd class="col-sm-9">{{ employee.date_hired or '' }}</dd>
+      <dt class="col-sm-3">Notes</dt><dd class="col-sm-9">{{ employee.notes or '' }}</dd>
+    </dl>
+    <a class="btn btn-secondary" href="{{ url_for('employee_edit', employee_id=employee.id) }}">Edit</a>
+    <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">Back to list</a>
+    """
+)
+
+EMPLOYEE_FORM_TEMPLATE = BASE_TEMPLATE.replace('{{ content|safe }}',
+    """
+    <h3>{{ action }} Employee</h3>
+    <form method="post">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.first_name.label(class_='form-label') }}
+        {{ form.first_name(class_='form-control') }}
+        {% for err in form.first_name.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.last_name.label(class_='form-label') }}
+        {{ form.last_name(class_='form-control') }}
+        {% for err in form.last_name.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.email.label(class_='form-label') }}
+        {{ form.email(class_='form-control') }}
+        {% for err in form.email.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.position.label(class_='form-label') }}
+        {{ form.position(class_='form-control') }}
+        {% for err in form.position.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.salary.label(class_='form-label') }}
+        {{ form.salary(class_='form-control') }}
+        {% for err in form.salary.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.date_hired.label(class_='form-label') }}
+        {{ form.date_hired(class_='form-control') }}
+        {% for err in form.date_hired.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.notes.label(class_='form-label') }}
+        {{ form.notes(class_='form-control', rows=4) }}
+      </div>
+      <button class="btn btn-primary" type="submit">{{ action }}</button>
+      <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">Cancel</a>
+    </form>
+    """
+)
+
+LOGIN_TEMPLATE = BASE_TEMPLATE.replace('{{ content|safe }}',
+    """
+    <h3>Login</h3>
+    <form method="post">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.email.label(class_='form-label') }}
+        {{ form.email(class_='form-control') }}
+      </div>
+      <div class="mb-3">
+        {{ form.password.label(class_='form-label') }}
+        {{ form.password(class_='form-control') }}
+      </div>
+      <button class="btn btn-primary" type="submit">Login</button>
+      <a class="btn btn-link" href="{{ url_for('register') }}">Register</a>
+    </form>
+    """
+)
+
+REGISTER_TEMPLATE = BASE_TEMPLATE.replace('{{ content|safe }}',
+    """
+    <h3>Register</h3>
+    <form method="post">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.email.label(class_='form-label') }}
+        {{ form.email(class_='form-control') }}
+        {% for err in form.email.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.password.label(class_='form-label') }}
+        {{ form.password(class_='form-control') }}
+        {% for err in form.password.errors %}<div class="text-danger">{{ err }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.confirm.label(class_='form-label') }}
+        {{ form.confirm(class_='form-control') }}
+      </div>
+      <button class="btn btn-primary" type="submit">Register</button>
+    </form>
+    """
+)
+
+
+# -----------------
+# Run
+# -----------------
+if __name__ == '__main__':
+    # Ensure DB dir exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+    app.run(debug=True)
